@@ -7,9 +7,13 @@ Author:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import spacy 
 
 from utils import cuda, load_cached_embeddings
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
+from allennlp.modules.elmo import Elmo, batch_to_ids
+
 
 
 def _sort_batch_by_length(tensor, sequence_lengths):
@@ -126,12 +130,92 @@ class BilinearOutput(nn.Module):
         super().__init__()
         self.linear = nn.Linear(q_dim, p_dim)
 
-    def forward(self, p, q, p_mask):
+
+    def binary_search(self, list, toFind):
+        low = 0
+        n = len(list)
+        high = n-1
+
+        while low + 1 < high:
+            mid = low + ((high - low)//2)
+            if list[mid] == toFind:
+                return mid
+            elif list[mid] < toFind:
+                low = mid
+            else:
+                high = mid
+
+        if list[low] == toFind:
+            return low
+        else:
+            return high
+
+
+
+    def forward(self, p, q, p_mask, passagesNer, questionsNer, passagesMaps, questionsMaps, rawPassages, rawQuestions, trueCasePassages, trueCaseQuestions):
         # Compute bilinear scores
         q_key = self.linear(q).unsqueeze(2)  # [batch_size, p_dim, 1]
         p_scores = torch.bmm(p, q_key).squeeze(2)  # [batch_size, p_len]
         # Assign -inf to pad tokens
         p_scores.data.masked_fill_(p_mask.data, -float('inf'))
+        questionNerSets = list()
+        for doc in questionsNer:
+            questionNerSet = set()
+            for ent in doc.ents:
+                questionNerSet.add(ent.text.lower())
+            questionNerSets.append(questionNerSet)
+
+        for i in range(len(passagesNer)):
+            
+            who = "who" in rawQuestions[i]
+            who_entities = ["PERSON", "ORG", "GPE", "NORP"]
+
+            when = "when" in rawQuestions[i]
+            when_entities = ["DATE", "TIME"]
+            
+            where = "where" in rawQuestions[i]
+            where_entities = ["FAC", "ORG", "GPE", "LOC", "EVENT"]
+
+            quantity = False
+            for x in range(0, len(rawQuestions[i])):
+                if (rawQuestions[i][x] == "how" and (rawQuestions[i][x + 1] == "much" or rawQuestions[i][x + 1] == "many")):
+                    quantity = True
+            quantity_entities = ["MONEY", "QUANTITY", "PERCENT", "CARDINAL"]
+
+            questionEntities = questionNerSets[i]
+
+            doc = passagesNer[i]
+            for ent in doc.ents:
+                sc = ent.start_char
+                ec = ent.end_char
+
+                wordIndex = self.binary_search(passagesMaps[i], sc)
+
+                curChar = sc
+
+                actualWord = trueCasePassages[i][wordIndex].lower()
+
+                while curChar + len(actualWord) <= ec:
+
+                    actualWord = trueCasePassages[i][wordIndex].lower()
+
+                    if actualWord in questionEntities:
+                        p_scores[i][wordIndex] += 1
+
+                    if who and ent.label_ in who_entities:
+                        p_scores[i][wordIndex] += 2
+                    elif when and ent.label_ in when_entities:
+                        p_scores[i][wordIndex] += 2
+                    elif where and ent.label_ in where_entities:
+                        p_scores[i][wordIndex] += 2
+                    elif quantity and ent.label_ in quantity_entities:
+                        p_scores[i][wordIndex] += 2
+
+                    wordIndex += 1
+                    curChar += len(actualWord) + 1 # 1 for the space pls
+                    
+            #exit()
+
         return p_scores  # [batch_size, p_len]
 
 
@@ -172,6 +256,7 @@ class BaselineReader(nn.Module):
 
         self.args = args
         self.pad_token_id = args.pad_token_id
+        self.spacy = spacy.load('en_core_web_sm') 
 
         # Initialize embedding layer (1)
         self.embedding = nn.Embedding(args.vocab_size, args.embedding_dim)
@@ -214,7 +299,16 @@ class BaselineReader(nn.Module):
         # Initialize bilinear layer for end positions (7)
         self.end_output = BilinearOutput(_hidden_dim, _hidden_dim)
 
-    def load_pretrained_embeddings(self, vocabulary, path):
+        options_file = "https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_options.json"
+        weight_file = "https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_weights.hdf5"
+
+        # Note the "1", since we want only 1 output representation for each token.
+        self.elmo = Elmo(options_file, weight_file, 1, dropout=0)
+
+
+        
+
+    def load_pretrained_embeddings(self, vocabulary, path, sentences):
         """
         Loads GloVe vectors and initializes the embedding matrix.
 
@@ -222,26 +316,11 @@ class BaselineReader(nn.Module):
             vocabulary: `Vocabulary` object.
             path: Embedding path, e.g. "glove/glove.6B.300d.txt".
         """
-        embedding_map = load_cached_embeddings(path)
 
-        # Create embedding matrix. By default, embeddings are randomly
-        # initialized from Uniform(-0.1, 0.1).
-        embeddings = torch.zeros(
-            (len(vocabulary), self.args.embedding_dim)
-        ).uniform_(-0.1, 0.1)
+        self.vocabulary = vocabulary
+        return 0
 
-        # Initialize pre-trained embeddings.
-        num_pretrained = 0
-        for (i, word) in enumerate(vocabulary.words):
-            if word in embedding_map:
-                embeddings[i] = torch.tensor(embedding_map[word])
-                num_pretrained += 1
-
-        # Place embedding matrix on GPU.
-        self.embedding.weight.data = cuda(self.args, embeddings)
-
-        return num_pretrained
-
+        
     def sorted_rnn(self, sequences, sequence_lengths, rnn):
         """
         Sorts and packs inputs, then feeds them into RNN.
@@ -275,17 +354,20 @@ class BaselineReader(nn.Module):
 
     def forward(self, batch):
         # Obtain masks and lengths for passage and question.
+        elmo = self.elmo.cuda()
+
+        passage_character_ids = batch_to_ids(batch["rawPassages"])
+        passage_embeddings = elmo(passage_character_ids.cuda())["elmo_representations"][0]
+
+
+        question_character_ids = batch_to_ids(batch['rawQuestions'])
+        question_embeddings = elmo(question_character_ids.cuda())["elmo_representations"][0]
+
         passage_mask = (batch['passages'] != self.pad_token_id)  # [batch_size, p_len]
         question_mask = (batch['questions'] != self.pad_token_id)  # [batch_size, q_len]
         passage_lengths = passage_mask.long().sum(-1)  # [batch_size]
         question_lengths = question_mask.long().sum(-1)  # [batch_size]
 
-        # 1) Embedding Layer: Embed the passage and question.
-        passage_embeddings = self.embedding(batch['passages'])  # [batch_size, p_len, p_dim]
-        question_embeddings = self.embedding(batch['questions'])  # [batch_size, q_len, q_dim]
-
-        # 2) Context2Query: Compute weighted sum of question embeddings for
-        #        each passage word and concatenate with passage embeddings.
         aligned_scores = self.aligned_att(
             passage_embeddings, question_embeddings, ~question_mask
         )  # [batch_size, p_len, q_len]
@@ -312,14 +394,65 @@ class BaselineReader(nn.Module):
         question_vector = question_scores.unsqueeze(1).bmm(question_hidden).squeeze(1)
         question_vector = self.dropout(question_vector)  # [batch_size, q_hid]
 
+        rawPassages = batch['rawPassages']
+        rawQuestions = batch['rawQuestions']
+
+        trueCasePassages = batch['trueCasePassages']
+        trueCaseQuestions = batch['trueCaseQuestions']
+
+        passagesNer = list()
+        passagesMaps = list()
+        for passage in trueCasePassages:
+            startOfEachWord = list() # list of tuples of (char index (start), word index)
+
+            joinedString = " ".join(passage)
+
+            newWord = True
+            wordCounter = 0
+            for i in range(len(joinedString)):
+                if newWord:
+                    startOfEachWord.append(i)
+                    wordCounter += 1
+                    newWord = False
+                if joinedString[i] == " ":
+                    newWord = True
+
+
+            pdoc = self.spacy(joinedString)
+            passagesNer.append(pdoc)
+            passagesMaps.append(startOfEachWord)
+
+        questionsNer = list()
+        questionsMaps = list()
+        for question in trueCaseQuestions:
+            startOfEachWord = list()
+            joinedString = " ".join(question)
+            newWord = True
+            wordCounter = 0
+            for i in range(len(joinedString)):
+                if newWord:
+                    startOfEachWord.append(i)
+                    wordCounter += 1
+                    newWord = False
+                if joinedString[i] == " ":
+                    newWord = True
+
+            qdoc = self.spacy(joinedString)
+            questionsNer.append(qdoc)
+            questionsMaps.append(startOfEachWord)
+
+
+
+
+
         # 6) Start Position Pointer: Compute logits for start positions
         start_logits = self.start_output(
-            passage_hidden, question_vector, ~passage_mask
+            passage_hidden, question_vector, ~passage_mask, passagesNer, questionsNer, passagesMaps, questionsMaps, rawPassages, rawQuestions, trueCasePassages, trueCaseQuestions
         )  # [batch_size, p_len]
 
         # 7) End Position Pointer: Compute logits for end positions
         end_logits = self.end_output(
-            passage_hidden, question_vector, ~passage_mask
+            passage_hidden, question_vector, ~passage_mask, passagesNer, questionsNer, passagesMaps, questionsMaps, rawPassages, rawQuestions, trueCasePassages, trueCaseQuestions
         )  # [batch_size, p_len]
 
         return start_logits, end_logits  # [batch_size, p_len], [batch_size, p_len]

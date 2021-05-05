@@ -167,7 +167,7 @@ parser.add_argument(
 parser.add_argument(
     '--embedding_dim',
     type=int,
-    default=300,
+    default=1024,
     help='embedding dimension',
 )
 parser.add_argument(
@@ -397,7 +397,6 @@ def write_predictions(args, model, dataset):
             official test datasets are blind and hosted by official servers).
     """
     # Load model checkpoint.
-    model.load_state_dict(torch.load(args.model_path, map_location='cpu'))
     model.eval()
 
     # Set up test dataloader.
@@ -421,7 +420,7 @@ def write_predictions(args, model, dataset):
             for j in range(start_logits.size(0)):
                 # Find question index and passage.
                 sample_index = args.batch_size * i + j
-                qid, passage, _, _, _ = dataset.samples[sample_index]
+                qid, passage, _, _, _, _, _ = dataset.samples[sample_index]
 
                 # Unpack start and end probabilities. Find the constrained
                 # (start, end) pair that has the highest joint probability.
@@ -478,10 +477,16 @@ def main(args):
     print(f'dev samples = {len(dev_dataset)}')
     print()
 
+    sentencesPlsDontLetThisVarBeTaken = list()
+    
+    for sample in train_dataset.samples:
+        passage = sample[1]
+        sentencesPlsDontLetThisVarBeTaken.append(passage)
+
     # Select model.
     model = _select_model(args)
     num_pretrained = model.load_pretrained_embeddings(
-        vocabulary, args.embedding_path
+        vocabulary, args.embedding_path, sentencesPlsDontLetThisVarBeTaken
     )
     pct_pretrained = round(num_pretrained / len(vocabulary) * 100., 2)
     print(f'using pre-trained embeddings from \'{args.embedding_path}\'')
